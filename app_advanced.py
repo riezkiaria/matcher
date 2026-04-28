@@ -588,13 +588,13 @@ def classify_amount_difference(invoice_amount, bank_amount):
         return 'EXACT_MATCH', 'HIGH', 0.0, "Exact Match (selisih 0)"
     
     # 2. PPh LIKELY (Pajak Penghasilan)
-    # Selisih NEGATIVE (payment < invoice) sekitar 1% - 2.5%
-    if -12.5 <= difference_pct * 100 <= -9.5:
+    # Selisih NEGATIVE (payment < invoice) sekitar 1.5% - 2.5%
+    if -2.5 <= difference_pct * 100 <= -1.5:
         return 'PPH_DEDUCTED', 'HIGH', difference_pct, f"PPh Dipotong (~{abs_diff_pct:.1f}%)"
     
     # 3. POSSIBLE PPN (VAT)
     # Selisih POSITIVE (payment > invoice) sekitar 10% - 12%
-    if 0.8 <= difference_pct * 100 <= 2.7:
+    if 10.0 <= difference_pct * 100 <= 12.0:
         return 'POSSIBLE_PPN', 'MEDIUM', difference_pct, f"Kemungkinan PPN termasuk (~{abs_diff_pct:.1f}%)"
     
     # 4. SMALL VARIANCE
