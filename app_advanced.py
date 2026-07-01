@@ -221,18 +221,61 @@ def load_bank_data(file):
                 'Balance': 'Balance'
             },
             'strategy': 'DESCRIPTION_FIRST'
+        },
+        {
+            'id': 'FORMAT_3',
+            'name': 'UMP (Uang Muka Penjualan)',
+            'required_columns': ['Receipt Amount', 'Customer Name'],
+            'header_row': 3,  # Header ada di baris ke-4 (0-indexed: 3)
+            'mapping': {
+                'Receipt Amount': 'Credit',  # Kolom ini berisi nominal IDR
+                'No': 'No',
+                'Receipt Method': 'Receipt Method',
+                'Receipt Number': 'Reference No.',
+                'Customer Name': 'Customer',
+                'Receipt Type': 'Receipt Type',
+                'State': 'State',
+                'Receipt Date': 'Value Date',
+                'Comments': 'Description',
+                'Account': 'Account'
+            },
+            'strategy': 'DESCRIPTION_FIRST'
         }
     ]
 
     # DETEKSI FORMAT SECARA OTOMATIS BERDASARKAN SIGNATURE
     detected_format = None
+    
+    # ✅ PRIORITAS 1: CEK FORMAT DENGAN HEADER ROW KHUSUS (FORMAT 3: UMP)
     for fmt in FORMAT_SIGNATURES:
-        # Hitung berapa banyak required column yang ada
-        matches = sum(1 for col in fmt['required_columns'] if col in df.columns)
-        # Jika 70% atau lebih kolom required ditemukan = itu formatnya
-        if matches >= len(fmt['required_columns']) * 0.7:
-            detected_format = fmt
-            break
+        if 'header_row' in fmt:
+            try:
+                # Coba baca dengan header row yang ditentukan
+                df_test = pd.read_excel(file, header=fmt['header_row'])
+                df_test.columns = df_test.columns.str.strip()
+                
+                # Hitung berapa banyak required column yang ada
+                matches = sum(1 for col in fmt['required_columns'] if col in df_test.columns)
+                
+                # Jika 70% atau lebih kolom required ditemukan = itu formatnya
+                if matches >= len(fmt['required_columns']) * 0.7:
+                    detected_format = fmt
+                    # Load ulang dengan header yang benar
+                    df = df_test
+                    break
+            except Exception:
+                continue
+    
+    # ✅ PRIORITAS 2: CEK FORMAT STANDARD (FORMAT 1 & 2)
+    if not detected_format:
+        for fmt in FORMAT_SIGNATURES:
+            if 'header_row' not in fmt:  # Skip yang sudah dicek
+                # Hitung berapa banyak required column yang ada
+                matches = sum(1 for col in fmt['required_columns'] if col in df.columns)
+                # Jika 70% atau lebih kolom required ditemukan = itu formatnya
+                if matches >= len(fmt['required_columns']) * 0.7:
+                    detected_format = fmt
+                    break
 
     if detected_format:
         format_type = detected_format['id']
@@ -274,8 +317,30 @@ def load_bank_data(file):
             # Jika masih kosong juga coba dari kolom Date
             df.loc[df['Date & Time'].isna() & df['Date'].notna(), 'Date & Time'] = pd.to_datetime(df.loc[df['Date & Time'].isna() & df['Date'].notna(), 'Date'], errors='coerce')
 
+        # ✅ SPESIAL HANDLING UNTUK FORMAT 3 (UMP)
+        if format_type == 'FORMAT_3':
+            # Pastikan Description diisi dari Comments jika kosong
+            if 'Description' in df.columns and 'Comments' in df.columns:
+                df['Description'] = df.apply(
+                    lambda row: row['Comments'] if pd.isna(row['Description']) or str(row['Description']).strip() == '' 
+                    else row['Description'], 
+                    axis=1
+                )
+            
+            # Konversi Receipt Date ke Value Date jika ada
+            if 'Receipt Date' in df.columns and 'Value Date' in df.columns:
+                df['Value Date'] = pd.to_datetime(df['Receipt Date'], errors='coerce')
+            
+            # Tambahkan kolom Date & Time dari Value Date jika belum ada
+            if 'Date & Time' not in df.columns or df['Date & Time'].isna().all():
+                df['Date & Time'] = df['Value Date']
+            
+            # Normalisasi Customer untuk UMP format (gunakan mapping yang sama dengan FORMAT 2)
+            if 'Customer' in df.columns:
+                df['Customer_normalized'] = df['Customer'].apply(normalize_customer_name)
+        
         # Normalisasi Customer JIKA ADA (untuk FORMAT 2)
-        if 'Customer' in df.columns and format_type == 'FORMAT_2':
+        elif 'Customer' in df.columns and format_type == 'FORMAT_2':
             df['Customer_normalized'] = df['Customer'].apply(normalize_customer_name)
 
     else:
