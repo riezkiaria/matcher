@@ -239,7 +239,7 @@ def load_bank_data(file):
                 'Comments': 'Description',
                 'Account': 'Account'
             },
-            'strategy': 'DESCRIPTION_FIRST'
+            'strategy': 'CUSTOMER_FIRST'
         }
     ]
 
@@ -464,8 +464,8 @@ def load_aging_data(file):
 def parse_universal_amount(value):
     """
     Universal amount parser yang mendukung BOTH format Indonesia dan US
-    ✅ Format ID: 22.200.000,00 → 22200000.0
-    ✅ Format US: 147,322,682,017.20 → 147322682017.20
+    ✅ Format ID: 22.200.000,00 -> 22200000.0
+    ✅ Format US: 147,322,682,017.20 -> 147322682017.20
     ✅ Otomatis deteksi format
     ✅ Tidak ada lagi error scaling 10x / 0.1x
     """
@@ -1123,6 +1123,7 @@ def advanced_matching_engine(df_bank, df_aging, progress_bar=None):
 
         bank_amount = bank_row['Credit']
         best_matches = []
+        matching_mode = "FALLBACK"
 
         # ==============================================
         # 🔹 ✅ PEMISAHAN TOTAL ALGORITMA PER FORMAT
@@ -1131,10 +1132,10 @@ def advanced_matching_engine(df_bank, df_aging, progress_bar=None):
         format_type = df_bank.attrs.get('format_type', 'FORMAT_1')
 
         # ==============================================
-        # 🔹 ✅ ALGORITMA KHUSUS FORMAT 2 (CUSTOMER FIRST)
-        # HANYA BERJALAN JIKA BENAR BENAR FORMAT 2
+        # 🔹 ✅ ALGORITMA KHUSUS FORMAT 2 & 3 (CUSTOMER FIRST)
+        # HANYA BERJALAN JIKA BENAR BENAR FORMAT 2 ATAU FORMAT 3
         # ==============================================
-        if format_type == 'FORMAT_2' and 'Customer_normalized' in bank_row:
+        if format_type in ('FORMAT_2', 'FORMAT_3') and 'Customer_normalized' in bank_row:
             bank_customer_norm = bank_row['Customer_normalized']
             bank_customer_original = bank_row['Customer']
 
@@ -1151,11 +1152,26 @@ def advanced_matching_engine(df_bank, df_aging, progress_bar=None):
                 filtered_candidates['similarity'] = filtered_candidates['Customer_normalized'].apply(
                     lambda x: fuzz.token_sort_ratio(x, bank_customer_norm)
                 )
-                filtered_candidates = filtered_candidates[
-                    filtered_candidates['similarity'] >= 90
-                ].sort_values('similarity', ascending=False).reset_index(drop=True)
+                
+                # KHUSUS FORMAT 3 (UMP): Tambahkan subset word matching
+                # Jika nama UMP adalah bagian dari nama aging (atau sebaliknya), tetap match
+                if format_type == 'FORMAT_3':
+                    bank_words = set(bank_customer_norm.split())
+                    filtered_candidates['is_subset_match'] = filtered_candidates['Customer_normalized'].apply(
+                        lambda x: bank_words.issubset(set(x.split())) or set(x.split()).issubset(bank_words)
+                    )
+                    # Match jika similarity >= 90 ATAU subset match
+                    filtered_candidates = filtered_candidates[
+                        (filtered_candidates['similarity'] >= 90) | (filtered_candidates['is_subset_match'] == True)
+                    ].sort_values('similarity', ascending=False).reset_index(drop=True)
+                else:
+                    # FORMAT 2: tetap strict 90%
+                    filtered_candidates = filtered_candidates[
+                        filtered_candidates['similarity'] >= 90
+                    ].sort_values('similarity', ascending=False).reset_index(drop=True)
 
-                st.info(f"🔒 FORMAT 2 LOCKED: Hanya match untuk Customer '{bank_customer_original}'")
+                format_label = 'FORMAT_2' if format_type == 'FORMAT_2' else 'FORMAT_3 (UMP)'
+                st.info(f"🔒 {format_label} LOCKED: Hanya match untuk Customer '{bank_customer_original}'")
 
                 if len(filtered_candidates) > 0:
                     # Step 1: Cari match amount dengan tolerance
@@ -1193,8 +1209,11 @@ def advanced_matching_engine(df_bank, df_aging, progress_bar=None):
                     # TIDAK PERNAH FALLBACK KE METODE LAMA / CUSTOMER LAIN
                     matching_mode = "LOCKED_CUSTOMER"
                     selected_customer = bank_customer_original
-                    # OVERRIDE filtered_candidates agar HANYA customer yang di lock
+                    # ✅ OVERRIDE filtered_candidates agar HANYA customer yang di lock
                     # Semua matching dibawah hanya akan berjalan untuk customer ini saja
+                    filtered_candidates = filtered_candidates[
+                        filtered_candidates['similarity'] >= 90
+                    ].reset_index(drop=True)
                 else:
                     # Customer tidak ada di AR Aging: Tandai sebagai unidentified, jangan match ke customer lain
                     results.append({
@@ -1217,22 +1236,24 @@ def advanced_matching_engine(df_bank, df_aging, progress_bar=None):
 
         # ==============================================
         # LAYER 0: MULTI-PATTERN SENDER EXTRACTION
+        # HANYA DIJALANKAN JIKA BELUM ADA LOCKED CUSTOMER
         # ==============================================
-        sender_candidates = extract_all_sender_candidates(bank_row['Description'])
-        best_customer, final_score = find_best_matching_customer(sender_candidates, df_aging['Customer'].unique())
+        if matching_mode != "LOCKED_CUSTOMER":
+            sender_candidates = extract_all_sender_candidates(bank_row['Description'])
+            best_customer, final_score = find_best_matching_customer(sender_candidates, df_aging['Customer'].unique())
 
-        sender_match_score = final_score
-        selected_customer = best_customer
-        matching_mode = "FALLBACK"
-        filtered_candidates = df_aging[~df_aging['aging_id'].isin(matched_invoice_ids)]
+            sender_match_score = final_score
+            selected_customer = best_customer
+            matching_mode = "FALLBACK"
+            filtered_candidates = df_aging[~df_aging['aging_id'].isin(matched_invoice_ids)]
 
-        if best_customer and final_score >= 80:
-            # ✅ SENDER VALID: HANYA MATCH KE CUSTOMER INI
-            matching_mode = "SENDER"
-            filtered_candidates = df_aging[
-                (df_aging['Customer'] == best_customer) &
-                (~df_aging['aging_id'].isin(matched_invoice_ids))
-            ].reset_index(drop=True)
+            if best_customer and final_score >= 80:
+                # ✅ SENDER VALID: HANYA MATCH KE CUSTOMER INI
+                matching_mode = "SENDER"
+                filtered_candidates = df_aging[
+                    (df_aging['Customer'] == best_customer) &
+                    (~df_aging['aging_id'].isin(matched_invoice_ids))
+                ].reset_index(drop=True)
 
         # ==============================================
         # LAYER 2: FILTER BY AMOUNT RANGE (OPTIMIZATION)
@@ -1270,25 +1291,20 @@ def advanced_matching_engine(df_bank, df_aging, progress_bar=None):
         if len(best_matches) == 0 or all(m['score'] < 60 for m in best_matches):
 
             # ✅ STRICT CUSTOMER FILTER (exact match setelah normalisasi)
-            if matching_mode == "SENDER" and selected_customer:
+            if matching_mode in ("SENDER", "LOCKED_CUSTOMER") and selected_customer and len(filtered_candidates) > 0:
                 # 🔒 LOCKED CUSTOMER MODE: HANYA GUNAKAN CUSTOMER TERSEBUT
                 # Normalisasi nama customer untuk exact match
                 selected_customer_clean = re.sub(r'\s+', ' ', selected_customer).strip().upper()
 
-                combo_candidates = filtered_candidates[
-                    (filtered_candidates['Customer'].apply(
-                        lambda x: re.sub(r'\s+', ' ', x).strip().upper() == selected_customer_clean
-                    )) &
-                    (filtered_candidates['SALDO PIUTANG'] < bank_amount) &
-                    (filtered_candidates['SALDO PIUTANG'] > bank_amount * 0.2)
-                ].head(30).to_dict('records')
+                # Buat mask secara terpisah untuk menghindari Arrow type error
+                customer_mask = filtered_candidates['Customer'].apply(
+                    lambda x: re.sub(r'\s+', ' ', x).strip().upper() == selected_customer_clean
+                )
+                amount_mask = (filtered_candidates['SALDO PIUTANG'] < bank_amount) & (filtered_candidates['SALDO PIUTANG'] > bank_amount * 0.2)
+                combo_candidates = filtered_candidates[customer_mask & amount_mask].head(30).to_dict('records')
 
                 # 🔒 HANYA 1 CUSTOMER GROUP (yang sudah di-filter)
-                customer_groups = [(selected_customer, filtered_candidates[
-                    (filtered_candidates['Customer'].apply(
-                        lambda x: re.sub(r'\s+', ' ', x).strip().upper() == selected_customer_clean
-                    ))
-                ])]
+                customer_groups = [(selected_customer, filtered_candidates[customer_mask])]
             else:
                 # 🔓 UNLOCKED MODE: GUNAKAN SEMUA CANDIDATE
                 combo_candidates = filtered_candidates[
@@ -1309,10 +1325,6 @@ def advanced_matching_engine(df_bank, df_aging, progress_bar=None):
             combo_score = 0
 
             # 🔹 Lakukan combination matching PER CUSTOMER GROUP
-            # ❌ JANGAN PERNAH SKIP BARIS! Paling tidak masuk ke UNIDENTIFIED
-            # if sender_match_score < 80:
-            #     continue
-
             for customer_name, group in customer_groups:
 
                 group_invoices = group.to_dict('records')
