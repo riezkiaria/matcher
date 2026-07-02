@@ -433,7 +433,10 @@ def load_aging_data(file):
                     'TOTAL PIUTANG': 'SALDO PIUTANG',
                     'OUTSTANDING': 'SALDO PIUTANG',
                     'TANGGAL INVOICE': 'Invoice Date',
-                    'INVOICE DATE': 'Invoice Date'
+                    'INVOICE DATE': 'Invoice Date',
+                    'TANGGAL': 'Invoice Date',
+                    'TGL': 'Invoice Date',
+                    'DATE': 'Invoice Date'
                 }
 
                 # Rename kolom sesuai mapping
