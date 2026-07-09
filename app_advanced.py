@@ -240,12 +240,85 @@ def load_bank_data(file):
                 'Account': 'Account'
             },
             'strategy': 'CUSTOMER_FIRST'
-        }
+        },
+        # FORMAT_4 (UMP Pending) dihapus dari FORM_SIGNATURES karena menggunakan
+        # metode deteksi anchor-scan khusus (PRIORITAS 0) untuk menangani merged header 3 baris
     ]
 
     # DETEKSI FORMAT SECARA OTOMATIS BERDASARKAN SIGNATURE
     detected_format = None
-    
+
+    # ==============================================
+    # ✅ PRIORITAS 0: ANCHOR-SCAN FORMAT_4 (UMP PENDING - MERGED HEADER 3 BARIS)
+    # Deteksi khusus untuk file dengan header merge vertikal & horizontal
+    # yang TIDAK bisa dibaca dengan pd.read_excel(file, header=N) biasa
+    # ==============================================
+    if not detected_format:
+        try:
+            df_raw = pd.read_excel(file, header=None)
+
+            anchor_row = None
+            col_no = col_date = col_ref = col_cust = None
+
+            # Cari baris yang mengandung 'BPUK' DAN 'CUSTOMER' sekaligus -> anchor header utama
+            for r in range(min(10, len(df_raw))):
+                row_vals = [str(v).strip().upper() if pd.notna(v) else '' for v in df_raw.iloc[r].tolist()]
+                if 'BPUK' in row_vals and 'CUSTOMER' in row_vals:
+                    anchor_row = r
+                    for c, val in enumerate(row_vals):
+                        if val == 'NO':
+                            col_no = c
+                        elif val == 'TGL TRANSFER':
+                            col_date = c
+                        elif val == 'BPUK':
+                            col_ref = c
+                        elif val == 'CUSTOMER':
+                            col_cust = c
+                    break
+
+            if anchor_row is not None and col_ref is not None and col_cust is not None:
+                # Cari kolom 'Rp.' di 1-2 baris di bawah anchor (sub-header amount)
+                col_credit = None
+                for offset in (1, 2):
+                    check_row = anchor_row + offset
+                    if check_row < len(df_raw):
+                        row_vals = [str(v).strip() if pd.notna(v) else '' for v in df_raw.iloc[check_row].tolist()]
+                        for c, val in enumerate(row_vals):
+                            if val == 'Rp.':
+                                col_credit = c
+                                break
+                    if col_credit is not None:
+                        break
+
+                if col_credit is not None:
+                    data_start = anchor_row + 3  # header memakan 3 baris total
+                    df_f4 = df_raw.iloc[data_start:].reset_index(drop=True)
+
+                    df = pd.DataFrame({
+                        'No': df_f4.iloc[:, col_no].values if col_no is not None else range(len(df_f4)),
+                        'Value Date': df_f4.iloc[:, col_date].values if col_date is not None else None,
+                        'Reference No.': df_f4.iloc[:, col_ref].values,
+                        'BPUK': df_f4.iloc[:, col_ref].values,  # Kolom BPUK sama dengan Reference No. dari Excel
+                        'Customer': df_f4.iloc[:, col_cust].values,
+                        'Credit': df_f4.iloc[:, col_credit].values,
+                    })
+
+                    # Hapus baris yang semua NaN
+                    df = df.dropna(how='all').reset_index(drop=True)
+
+                    detected_format = {
+                        'id': 'FORMAT_4',
+                        'name': 'UMP Pending',
+                        'strategy': 'CUSTOMER_FIRST'
+                        # SENGAJA TANPA key 'mapping' -> sinyal bahwa kolom sudah final
+                    }
+                    format_type = 'FORMAT_4'
+
+                    st.success(f"✅ Format terdeteksi: UMP Pending (FORMAT_4) — merged header di baris ke-{anchor_row + 1}")
+                    st.info(f"🔧 Kolom terdeteksi -> No: kol {col_no}, Tgl: kol {col_date}, BPUK: kol {col_ref}, Customer: kol {col_cust}, Rp.: kol {col_credit}")
+        except Exception as e:
+            st.warning(f"⚠️ Gagal menjalankan deteksi khusus FORMAT_4: {e}")
+
     # ✅ PRIORITAS 1: CEK FORMAT DENGAN HEADER ROW KHUSUS (FORMAT 3: UMP)
     for fmt in FORMAT_SIGNATURES:
         if 'header_row' in fmt:
@@ -279,19 +352,21 @@ def load_bank_data(file):
 
     if detected_format:
         format_type = detected_format['id']
-        st.success(f"✅ Format terdeteksi: {detected_format['name']} ({format_type})")
-        st.info(f"🔧 Matching Strategy: {detected_format['strategy']}")
+        if format_type != 'FORMAT_4':
+            st.success(f"✅ Format terdeteksi: {detected_format['name']} ({format_type})")
+            st.info(f"🔧 Matching Strategy: {detected_format['strategy']}")
 
-        # DYNAMIC COLUMN MAPPING - SEMUA VARIASI NAMA KOLOM OTOMATIS
-        mapped_cols = {}
-        for original_col in df.columns:
-            clean_col = original_col.strip()
-            # Cari di mapping
-            if clean_col in detected_format['mapping']:
-                mapped_cols[original_col] = detected_format['mapping'][clean_col]
+        # DYNAMIC COLUMN MAPPING - hanya untuk format yang punya mapping (bukan FORMAT_4)
+        if 'mapping' in detected_format:
+            mapped_cols = {}
+            for original_col in df.columns:
+                clean_col = original_col.strip()
+                # Cari di mapping
+                if clean_col in detected_format['mapping']:
+                    mapped_cols[original_col] = detected_format['mapping'][clean_col]
 
-        # Apply mapping
-        df = df.rename(columns=mapped_cols)
+            # Apply mapping
+            df = df.rename(columns=mapped_cols)
 
         # GENERATE MISSING COLUMNS OTOMATIS
         STANDARD_COLUMNS = ['Date', 'Value Date', 'Description', 'Reference No.',
@@ -309,7 +384,8 @@ def load_bank_data(file):
                 df['Value Date'] = pd.to_datetime(df['Date & Time'], errors='coerce')
         
         # ✅ FIX DATE & TIME BLANK: Fallback isi Date & Time jika kosong
-        if 'Date & Time' in df.columns:
+        # SKIP untuk FORMAT_4 karena Value Date masih raw string di titik ini
+        if 'Date & Time' in df.columns and format_type != 'FORMAT_4':
             # Jika Date & Time kosong atau tidak valid, isi dengan Value Date
             df['Date & Time'] = pd.to_datetime(df['Date & Time'], errors='coerce')
             df.loc[df['Date & Time'].isna(), 'Date & Time'] = df.loc[df['Date & Time'].isna(), 'Value Date']
@@ -336,6 +412,48 @@ def load_bank_data(file):
                 df['Date & Time'] = df['Value Date']
             
             # Normalisasi Customer untuk UMP format (gunakan mapping yang sama dengan FORMAT 2)
+            if 'Customer' in df.columns:
+                df['Customer_normalized'] = df['Customer'].apply(normalize_customer_name)
+        
+        # ✅ SPESIAL HANDLING UNTUK FORMAT 4 (UMP PENDING)
+        if format_type == 'FORMAT_4':
+            # 1. Hapus baris kosong (blank row pemisah tahun dan header)
+            df = df.dropna(how='all').reset_index(drop=True)
+            
+            # 2. Drop baris yang NO-nya kosong (blank row pemisah)
+            if 'No' in df.columns:
+                df = df[df['No'].notna() & (df['No'] != '')].reset_index(drop=True)
+            
+            # 3. Hapus baris duplikat header yang mungkin terbaca
+            df = df[df['Customer'].notna() & (df['Customer'] != '')].reset_index(drop=True)
+            df = df[df['Customer'].str.strip().str.upper() != 'CUSTOMER'].reset_index(drop=True)
+            
+            # 4. Konversi Value Date dari TGL TRANSFER (format: 03-JUN-2024 atau 03/06/2024)
+            if 'Value Date' in df.columns:
+                # Bersihkan whitespace dan karakter tersembunyi sebelum parsing
+                df['Value Date'] = df['Value Date'].astype(str).str.strip()
+                
+                # Coba parse dengan format text Inggris dulu (03-JUN-2024)
+                df['Value Date'] = pd.to_datetime(df['Value Date'], format='%d-%b-%Y', errors='coerce')
+                # Fallback: format numerik (03/06/2024)
+                df.loc[df['Value Date'].isna(), 'Value Date'] = pd.to_datetime(
+                    df.loc[df['Value Date'].isna(), 'Value Date'], errors='coerce', dayfirst=True
+                )
+            
+            # ✅ Hilangkan komponen jam (normalize ke 00:00:00)
+            if 'Value Date' in df.columns:
+                df['Value Date'] = df['Value Date'].dt.normalize()
+            
+            # ✅ Isi Date & Time dari Value Date agar tidak kosong di display
+            if 'Date & Time' in df.columns:
+                df['Date & Time'] = df['Value Date']
+            
+            # 5. Seed Description dari Customer name agar matching scoring tetap akurat
+            # Karena FORMAT_4 tidak punya kolom Description, gunakan Customer sebagai Description
+            if 'Customer' in df.columns:
+                df['Description'] = df['Customer'].astype(str).str.strip().str.upper()
+            
+            # 6. Normalisasi Customer
             if 'Customer' in df.columns:
                 df['Customer_normalized'] = df['Customer'].apply(normalize_customer_name)
         
@@ -554,7 +672,8 @@ def clean_data(df_bank, df_aging):
     df_bank['Description'] = df_bank['Description'].str.replace(r'\s+', ' ', regex=True)
     df_bank['Description'] = df_bank['Description'].str.upper()
 
-    df_bank['Reference No.'] = df_bank['Reference No.'].astype(str).str.strip().str.upper()
+    if 'Reference No.' in df_bank.columns:
+        df_bank['Reference No.'] = df_bank['Reference No.'].astype(str).str.strip().str.upper()
 
     # ✅ KONVERSI CREDIT DENGAN UNIVERSAL PARSER
     df_bank['Credit'] = df_bank['Credit'].apply(parse_universal_amount)
@@ -1135,10 +1254,10 @@ def advanced_matching_engine(df_bank, df_aging, progress_bar=None):
         format_type = df_bank.attrs.get('format_type', 'FORMAT_1')
 
         # ==============================================
-        # 🔹 ✅ ALGORITMA KHUSUS FORMAT 2 & 3 (CUSTOMER FIRST)
-        # HANYA BERJALAN JIKA BENAR BENAR FORMAT 2 ATAU FORMAT 3
+        # 🔹 ✅ ALGORITMA KHUSUS FORMAT 2, 3 & 4 (CUSTOMER FIRST)
+        # HANYA BERJALAN JIKA BENAR BENAR FORMAT 2, 3 ATAU FORMAT 4
         # ==============================================
-        if format_type in ('FORMAT_2', 'FORMAT_3') and 'Customer_normalized' in bank_row:
+        if format_type in ('FORMAT_2', 'FORMAT_3', 'FORMAT_4') and 'Customer_normalized' in bank_row:
             bank_customer_norm = bank_row['Customer_normalized']
             bank_customer_original = bank_row['Customer']
 
@@ -1173,8 +1292,16 @@ def advanced_matching_engine(df_bank, df_aging, progress_bar=None):
                         filtered_candidates['similarity'] >= 90
                     ].sort_values('similarity', ascending=False).reset_index(drop=True)
 
-                format_label = 'FORMAT_2' if format_type == 'FORMAT_2' else 'FORMAT_3 (UMP)'
-                st.info(f"🔒 {format_label} LOCKED: Hanya match untuk Customer '{bank_customer_original}'")
+                # Set format label sesuai format yang terdeteksi
+                if format_type == 'FORMAT_2':
+                    format_label = 'FORMAT_2'
+                    st.info(f"🔒 FORMAT_2 LOCKED: Hanya match untuk Customer '{bank_customer_original}'")
+                elif format_type == 'FORMAT_3':
+                    format_label = 'FORMAT_3 (UMP)'
+                    st.info(f"🔒 FORMAT_3 (UMP) LOCKED: Hanya match untuk Customer '{bank_customer_original}'")
+                else:
+                    format_label = 'FORMAT_4 (UMP Pending)'
+                    # FORMAT_4: log di-supress agar tidak terlalu panjang ke bawah
 
                 if len(filtered_candidates) > 0:
                     # Step 1: Cari match amount dengan tolerance
@@ -1187,6 +1314,14 @@ def advanced_matching_engine(df_bank, df_aging, progress_bar=None):
                         # ✅ PERFECT MATCH: CUSTOMER + AMOUNT
                         best_match = amount_matches.iloc[0]
 
+                        # Matching_Note sesuai format
+                        if format_type == 'FORMAT_4':
+                            matching_note = 'FORMAT_4 (UMP Pending) Customer Match'
+                        elif format_type == 'FORMAT_3':
+                            matching_note = 'FORMAT_3 (UMP) Customer Match'
+                        else:
+                            matching_note = 'FORMAT_2 Direct Match'
+
                         results.append({
                             **bank_row.to_dict(),
                             'No Invoice': best_match['No Invoice'],
@@ -1196,7 +1331,7 @@ def advanced_matching_engine(df_bank, df_aging, progress_bar=None):
                             'confidence': 'HIGH',
                             'match_type': 'CUSTOMER_AMOUNT_EXACT',
                             'reasons': f"✅ EXACT MATCH: Customer '{bank_customer_norm}' dengan amount yang sesuai",
-                            'Matching_Note': 'FORMAT_2 Direct Match',
+                            'Matching_Note': matching_note,
                             'is_combination': False,
                             'matched_invoice_count': 1,
                             'customer_similarity': 100,
@@ -1431,6 +1566,18 @@ def advanced_matching_engine(df_bank, df_aging, progress_bar=None):
     # AMBIL YANG CONFIDENCE TERTINGGI
     df_result = pd.DataFrame(results)
     
+    # ✅ PROPAGATE FORMAT TYPE ke df_result agar Excel output bisa mendeteksi FORMAT_4
+    df_result.attrs['format_type'] = df_bank.attrs.get('format_type', 'FORMAT_1')
+    
+    # ✅ FIX: Guard against empty results
+    if df_result.empty:
+        return pd.DataFrame(columns=[
+            'bank_id', 'Value Date', 'Reference No.', 'Description', 'Credit',
+            'Customer', 'No Invoice', 'Saldo Piutang', 'score', 'confidence',
+            'match_type', 'reasons', 'is_combination', 'matched_invoice_count',
+            'customer_similarity', 'amount_diff', 'amount_diff_pct'
+        ])
+
     # Urutkan berdasarkan confidence tertinggi dulu
     confidence_order = {'HIGH': 0, 'MEDIUM': 1, 'LOW': 2, 'NONE': 3}
     df_result['confidence_sort'] = df_result['confidence'].map(confidence_order)
@@ -1461,13 +1608,27 @@ def generate_excel_output(df_result):
 
     # Kolom urutan yang diminta
     display_columns = [
-        'Value Date', 'Description', 'Credit', 'Customer',
+        'Value Date', 'Reference No.', 'BPUK', 'Description', 'Credit', 'Customer',
         'No Invoice', 'confidence', 'match_type', 'reasons',
-        'score', 'Saldo Piutang', 'amount_diff'
+        'score', 'Saldo Piutang', 'amount_diff', 'Difference %'
     ]
+    
+    # ✅ TAMBAHKAN KOLOM Difference % DARI amount_diff_pct (dalam bentuk persentase)
+    if 'amount_diff_pct' not in df_result.columns:
+        df_result['amount_diff_pct'] = 0.0
+    df_result['Difference %'] = df_result['amount_diff_pct'].apply(
+        lambda x: f"{x*100:.1f}%" if pd.notna(x) else "0%"
+    )
 
     # Filter kolom yang ada di DataFrame
     display_columns = [col for col in display_columns if col in df_result.columns]
+
+    # ✅ HILANGKAN KOLOM DESCRIPTION DAN BPUK DARI EXCEL UNTUK FORMAT_4 (UMP Pending)
+    # FORMAT_4 tidak punya kolom Description asli, kolom ini hanya dibuat untuk matching
+    # BPUK juga dihapus karena sama dengan Reference No.
+    format_type = df_result.attrs.get('format_type', 'FORMAT_1')
+    if format_type == 'FORMAT_4':
+        display_columns = [col for col in display_columns if col not in ('Description', 'BPUK')]
 
     # Pisahkan data per kategori
     high_conf = df_result[df_result['confidence'] == 'HIGH'][display_columns].copy()
@@ -1729,12 +1890,18 @@ def main():
             low_conf = len(df_result[df_result['confidence'] == 'LOW'])
             unidentified = len(df_result[df_result['confidence'] == 'NONE'])
 
+            # ✅ FIX: Guard against division by zero when total_trans == 0
+            def pct_str(count, total):
+                if total == 0:
+                    return "0%"
+                return f"{round(count/total*100,1)}%"
+
             sum_col1, sum_col2, sum_col3, sum_col4, sum_col5 = st.columns(5)
             sum_col1.metric("Total Transaksi", total_trans)
-            sum_col2.metric("✅ HIGH CONFIDENCE", high_conf, f"{round(high_conf/total_trans*100,1)}%")
-            sum_col3.metric("⚠️ MEDIUM CONFIDENCE", medium_conf, f"{round(medium_conf/total_trans*100,1)}%")
-            sum_col4.metric("🔍 LOW CONFIDENCE", low_conf, f"{round(low_conf/total_trans*100,1)}%")
-            sum_col5.metric("❌ UNIDENTIFIED", unidentified, f"{round(unidentified/total_trans*100,1)}%")
+            sum_col2.metric("✅ HIGH CONFIDENCE", high_conf, pct_str(high_conf, total_trans))
+            sum_col3.metric("⚠️ MEDIUM CONFIDENCE", medium_conf, pct_str(medium_conf, total_trans))
+            sum_col4.metric("🔍 LOW CONFIDENCE", low_conf, pct_str(low_conf, total_trans))
+            sum_col5.metric("❌ UNIDENTIFIED", unidentified, pct_str(unidentified, total_trans))
 
             st.markdown("---")
 
@@ -1746,24 +1913,36 @@ def main():
                 "❌ UNIDENTIFIED"
             ])
 
+            # ✅ FIX: Use 'Value Date' if 'Date & Time' is not available (not all formats have it)
+            date_col = 'Date & Time' if 'Date & Time' in df_display.columns else 'Value Date'
+            display_cols = [date_col, 'Description', 'Credit', 'No Invoice', 'Customer', 'match_type', 'score', 'reasons']
+            display_cols_none = [date_col, 'Description', 'Credit']
+            
+            # ✅ HILANGKAN KOLOM DESCRIPTION DARI HASIL UNTUK FORMAT_4 (UMP Pending)
+            # FORMAT_4 tidak punya kolom Description asli, kolom ini hanya dibuat untuk matching
+            format_type = df_result.attrs.get('format_type', 'FORMAT_1')
+            if format_type == 'FORMAT_4':
+                display_cols = [c for c in display_cols if c != 'Description']
+                display_cols_none = [c for c in display_cols_none if c != 'Description']
+
             with tab1:
                 st.dataframe(df_display[df_display['confidence'] == 'HIGH'][
-                    ['Date & Time', 'Description', 'Credit', 'No Invoice', 'Customer', 'match_type', 'score', 'reasons']
+                    [c for c in display_cols if c in df_display.columns]
                 ], width='stretch')
 
             with tab2:
                 st.dataframe(df_display[df_display['confidence'] == 'MEDIUM'][
-                    ['Date & Time', 'Description', 'Credit', 'No Invoice', 'Customer', 'match_type', 'score', 'reasons']
+                    [c for c in display_cols if c in df_display.columns]
                 ], width='stretch')
 
             with tab3:
                 st.dataframe(df_display[df_display['confidence'] == 'LOW'][
-                    ['Date & Time', 'Description', 'Credit', 'No Invoice', 'Customer', 'match_type', 'score', 'reasons']
+                    [c for c in display_cols if c in df_display.columns]
                 ], width='stretch')
 
             with tab4:
                 st.dataframe(df_display[df_display['confidence'] == 'NONE'][
-                    ['Date & Time', 'Description', 'Credit']
+                    [c for c in display_cols_none if c in df_display.columns]
                 ], width='stretch')
 
             # Download Button
